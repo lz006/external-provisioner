@@ -121,6 +121,9 @@ const (
 	snapshotAPIGroup = snapapi.GroupName       // "snapshot.storage.k8s.io"
 	pvcKind          = "PersistentVolumeClaim" // Native types don't require an API group
 
+	restoreKind     = "Restore"
+	topolvmAPIGroup = "topolvm.cybozu.com"
+
 	tokenPVNameKey       = "pv.name"
 	tokenPVCNameKey      = "pvc.name"
 	tokenPVCNameSpaceKey = "pvc.namespace"
@@ -199,6 +202,7 @@ type ProvisionerCSITranslator interface {
 type requiredCapabilities struct {
 	snapshot bool
 	clone    bool
+	restore  bool
 }
 
 // CSIProvisioner struct
@@ -481,6 +485,17 @@ func (p *csiProvisioner) Provision(ctx context.Context, options controller.Provi
 			rc.snapshot = true
 		case pvcKind:
 			rc.clone = true
+		case restoreKind:
+			if *(options.PVC.Spec.DataSource.APIGroup) == topolvmAPIGroup {
+				rc.restore = true
+				klog.Infof("DataSource %s/%s specified", topolvmAPIGroup, restoreKind)
+			} else {
+				klog.Infof("DataSource specified (%s) is not supported by the provisioner, waiting for an external data populator to create the volume", options.PVC.Spec.DataSource.Kind)
+				// DataSource is not VolumeSnapshot and PVC
+				// Wait for an external data populator to create the volume
+				p.eventRecorder.Event(options.PVC, v1.EventTypeNormal, "Provisioning", fmt.Sprintf("Waiting for a volume to be created by an external data populator"))
+				return nil, controller.ProvisioningFinished, nil
+			}
 		default:
 			klog.Infof("DataSource specified (%s) is not supported by the provisioner, waiting for an external data populator to create the volume", options.PVC.Spec.DataSource.Kind)
 			// DataSource is not VolumeSnapshot and PVC
@@ -539,7 +554,7 @@ func (p *csiProvisioner) Provision(ctx context.Context, options controller.Provi
 		},
 	}
 
-	if options.PVC.Spec.DataSource != nil && (rc.clone || rc.snapshot) {
+	if options.PVC.Spec.DataSource != nil && (rc.clone || rc.snapshot || rc.restore) {
 		volumeContentSource, err := p.getVolumeContentSource(ctx, options)
 		if err != nil {
 			return nil, controller.ProvisioningNoChange, fmt.Errorf("error getting handle for DataSource Type %s by Name %s: %v", options.PVC.Spec.DataSource.Kind, options.PVC.Spec.DataSource.Name, err)
@@ -618,6 +633,11 @@ func (p *csiProvisioner) Provision(ctx context.Context, options controller.Provi
 		req.Parameters[pvcNameKey] = options.PVC.GetName()
 		req.Parameters[pvcNamespaceKey] = options.PVC.GetNamespace()
 		req.Parameters[pvNameKey] = pvName
+	}
+
+	if options.PVC.Spec.DataSource != nil && rc.restore {
+		req.Parameters["csi.storage.k8s.io/pvc/datasource/kind"] = options.PVC.Spec.DataSource.Kind
+		req.Parameters[pvcNamespaceKey] = options.PVC.GetNamespace()
 	}
 
 	createCtx, cancel := context.WithTimeout(ctx, p.timeout)
@@ -815,9 +835,27 @@ func (p *csiProvisioner) getVolumeContentSource(ctx context.Context, options con
 	case pvcKind:
 		return p.getPVCSource(ctx, options)
 	default:
-		// For now we shouldn't pass other things to this function, but treat it as a noop and extend as needed
-		return nil, nil
+		// Get Custom Data Source info
+		return p.getCustomSource(ctx, options)
 	}
+}
+
+// getCustomSource verifies DataSource.Kind, making sure that the requested Object is available/ready
+// returns the VolumeContentSource for the requested PVC
+func (p *csiProvisioner) getCustomSource(ctx context.Context, options controller.ProvisionOptions) (*csi.VolumeContentSource, error) {
+	//TODO: Check if referenced object exists
+
+	volumeSource := csi.VolumeContentSource_Volume{
+		Volume: &csi.VolumeContentSource_VolumeSource{
+			VolumeId: options.PVC.Spec.DataSource.Name,
+		},
+	}
+	klog.V(5).Infof("VolumeContentSource_Volume %+v", volumeSource)
+
+	volumeContentSource := &csi.VolumeContentSource{
+		Type: &volumeSource,
+	}
+	return volumeContentSource, nil
 }
 
 // getPVCSource verifies DataSource.Kind of type PersistentVolumeClaim, making sure that the requested PVC is available/ready
